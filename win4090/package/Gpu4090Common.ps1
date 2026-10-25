@@ -80,6 +80,27 @@ function Get-Gpu4090PendingCopies($Files) {
   $Files | Where-Object {
     -not (Test-Path -LiteralPath $_.Dest) -or (Get-FileHash -LiteralPath $_.Dest -Algorithm SHA256).Hash.ToLower() -ne $_.Hash.ToLower() }
 }
+# Windows Fast Startup: a "shut down" hibernates the kernel session, so the card may come up without the unlock.
+# HiberbootEnabled is a DWORD; a missing value is the Windows default (on). A Group Policy value overrides the local one.
+$Gpu4090PowerKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power'
+$Gpu4090FastStartupPolicyKey = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
+# Exists and Value of HiberbootEnabled under $Key (the parameter lets the tests use a scratch key).
+function Get-Gpu4090FastStartup([string]$Key = $Gpu4090PowerKey) {
+  $k = Get-Item -LiteralPath $Key -ErrorAction SilentlyContinue
+  $exists = $k -and ($k.GetValueNames() -contains 'HiberbootEnabled')
+  if ($exists -and $k.GetValueKind('HiberbootEnabled') -ne 'DWord') { throw "HiberbootEnabled under $Key is not a DWORD." }
+  [pscustomobject]@{ Exists = [bool]$exists; Value = $(if ($exists) { [int]$k.GetValue('HiberbootEnabled') } else { $null }) }
+}
+# Writes $State (Exists, Value) back: a DWORD, or no value when Exists is false. Reads it back and throws on a mismatch.
+function Set-Gpu4090FastStartup($State, [string]$Key = $Gpu4090PowerKey) {
+  if ($State.Exists) { New-ItemProperty -LiteralPath $Key -Name HiberbootEnabled -PropertyType DWord -Value ([int]$State.Value) -Force | Out-Null }
+  elseif ((Get-Gpu4090FastStartup $Key).Exists) { Remove-ItemProperty -LiteralPath $Key -Name HiberbootEnabled }
+  $now = Get-Gpu4090FastStartup $Key
+  if ($now.Exists -ne [bool]$State.Exists -or ($now.Exists -and $now.Value -ne [int]$State.Value)) {
+    throw "HiberbootEnabled under $Key did not read back as written."
+  }
+}
+function Format-Gpu4090FastStartup($State) { if ($State.Exists) { "HiberbootEnabled=$($State.Value)" } else { 'HiberbootEnabled not set (Windows default: on)' } }
 # Extra bytes the copy needs on the target: the pending sources minus the destination files they replace.
 function Measure-Gpu4090CopyBytes($Pending) {
   [long]$bytes = 0

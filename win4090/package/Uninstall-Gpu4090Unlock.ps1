@@ -2,7 +2,8 @@
 #Requires -RunAsAdministrator
 <#
 .SYNOPSIS
-  Removes the RTX 4090 pre-boot unlock: deletes its firmware boot entry and its files.
+  Removes the RTX 4090 pre-boot unlock: deletes its firmware boot entry and its files, and puts Windows Fast Startup
+  back to its value before the install if the installer turned it off.
 .DESCRIPTION
   DEFAULT IS A DRY RUN; add -Apply to make the changes. Windows Boot Manager is never modified.
   Only the program's folders are deleted; no partition is deleted or resized. A partition labeled GPU4090 stays
@@ -34,6 +35,15 @@ else {
     try { foreach ($d in 'EFI\GPU4090', 'GPU4090-ASSETS', 'GPU4090-UNLOCK') { Remove-Item (Join-Path $v.Root $d) -Recurse -Force -ErrorAction SilentlyContinue } }
     finally { Dismount-Gpu4090Volume $v }
   }
+}
+
+# Records from v0.1.0 have no Fast Startup fields: nothing to restore.
+if ($r.fastStartupChanged) {
+  $now = Get-Gpu4090FastStartup
+  if ($now.Exists -and $now.Value -eq 0) {
+    Step "restore Windows Fast Startup to its value before the install ($(Format-Gpu4090FastStartup $r.fastStartupBefore))"
+    if ($Apply) { Set-Gpu4090FastStartup $r.fastStartupBefore }
+  } else { Write-Host "Fast Startup was changed after the install ($(Format-Gpu4090FastStartup $now)); leaving it as it is." }
 }
 
 Step "delete $Gpu4090Data (install record, check and uninstall tools)"

@@ -20,6 +20,10 @@
 .PARAMETER Variant
   Auto   unlock after a 3 s countdown (Esc opens the menu)                                  [default]
   Manual same program, but the countdown ends in plain Windows; press U (or menu 1) to unlock
+.PARAMETER KeepFastStartup
+  Leave Windows Fast Startup as it is. By default the installer turns it off (HiberbootEnabled=0), because a Fast Startup
+  "shut down" hibernates the kernel session and the card may come up without the unlock. The old value goes into the
+  install record, and Uninstall puts it back.
 .EXAMPLE
   .\Install-Gpu4090Unlock.ps1                 # inspect and show the plan
   .\Install-Gpu4090Unlock.ps1 -Apply          # do it
@@ -31,6 +35,7 @@ param(
   [ValidateSet('Auto', 'Reuse', 'Esp', 'FreeSpace', 'NewPartition', 'Volume')][string]$Target = 'Auto',
   [string]$VolumeLetter,
   [int]$NewPartitionMB = 0,
+  [switch]$KeepFastStartup,
   [switch]$Apply
 )
 $ErrorActionPreference = 'Stop'
@@ -52,6 +57,9 @@ try {   # a new boot component can make BitLocker ask for its recovery key once
   $bl = Get-BitLockerVolume -MountPoint $env:SystemDrive -ErrorAction Stop
   if ($bl.ProtectionStatus -eq 'On') { Write-Warning "BitLocker is ON for $env:SystemDrive. Adding a boot entry may make the next start ask for the recovery key. Have the key ready, or run: Suspend-BitLocker -MountPoint $env:SystemDrive -RebootCount 2" }
 } catch { }
+$fastStartup = Get-Gpu4090FastStartup
+$fastStartupPolicy = Get-Gpu4090FastStartup $Gpu4090FastStartupPolicyKey
+if ($fastStartupPolicy.Exists -and $fastStartupPolicy.Value -ne 0) { Write-Warning 'A Group Policy ("Require use of fast startup") keeps Fast Startup on, whatever this installer sets. The card may come up without the unlock after a shut down and start; restart instead, or have the policy changed.' }
 
 # --- 2. The package is complete and unmodified (transport check, once, at install time) -----------
 $efiName = if ($Variant -eq 'Auto') { 'UNLOCK4090.EFI' } else { 'UNLOCK4090M.EFI' }
@@ -211,6 +219,21 @@ try {
     Write-Host "Firmware boot order: $($order -join ', ')"
   }
 
+  # --- 7b. Fast Startup off (after the boot entry, so a failed install never leaves it changed) ----
+  $rec.fastStartupChanged = $false; $rec.fastStartupKept = [bool]$KeepFastStartup
+  if ($fastStartup.Exists -and $fastStartup.Value -eq 0) { Write-Host 'Fast Startup is already off.' }
+  elseif ($KeepFastStartup) { Write-Host "Leaving Fast Startup on (-KeepFastStartup, $(Format-Gpu4090FastStartup $fastStartup)): the card may come up without the unlock after a shut down and start; restart instead." }
+  else {
+    Step "turn Windows Fast Startup off ($(Format-Gpu4090FastStartup $fastStartup) -> HiberbootEnabled=0); Uninstall restores it"
+    if ($Apply) {
+      # The old value is in the record before anything changes.
+      $rec.fastStartupBefore = [ordered]@{ Exists = $fastStartup.Exists; Value = $fastStartup.Value }
+      $rec.fastStartupChanged = $true; Save-Gpu4090Record $rec
+      Set-Gpu4090FastStartup @{ Exists = $true; Value = 0 }
+    }
+  }
+  if ($Apply) { Save-Gpu4090Record $rec }
+
   # --- 8. Keep a new partition out of Explorer (no letter, so no low-disk-space warnings for it) ----
   if ($choice -in 'FreeSpace', 'NewPartition') {
     Step "remove the drive letter from the new partition and keep Windows from assigning one (the boot entry does not use letters)"
@@ -227,6 +250,7 @@ try {
     foreach ($t in $Gpu4090Tools) { $p = Join-Path $PackageDir $t; if (Test-Path $p) { Copy-Item $p $Gpu4090Data -Recurse -Force } }
     Write-Host "`nInstalled. Restart. On the next boot you get a 3 second countdown; Esc opens the menu."
     Write-Host 'If the screen does not come back, power off, then use the firmware boot menu to pick Windows Boot Manager.'
+    Write-Host 'Sleep returns the card to stock: after waking the PC from sleep, restart to unlock again.'
     Write-Host "After the restart, check it: $Gpu4090Data\Check.cmd"
   } else {
     Write-Host "`nNothing was changed. Run again with -Apply to perform the steps above."

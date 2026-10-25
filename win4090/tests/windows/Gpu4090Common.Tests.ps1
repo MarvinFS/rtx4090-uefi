@@ -48,3 +48,35 @@ Describe 'Get-Gpu4090PendingCopies and Measure-Gpu4090CopyBytes' {
   It 'copies a missing file'                                 { ($pending | ForEach-Object { Split-Path $_.Dest -Leaf }) -contains 'c.bin' | Should Be $true }
   It 'net bytes = sources of pending minus replaced destinations' { Measure-Gpu4090CopyBytes $pending | Should Be (8 + 4 - 2) }
 }
+
+Describe 'Get-Gpu4090FastStartup and Set-Gpu4090FastStartup' {
+  # A scratch key under HKCU stands in for the Power key; HKLM is never touched.
+  $key = "HKCU:\Software\Gpu4090UnlockTest-$([guid]::NewGuid())"
+  New-Item -Path $key -Force | Out-Null
+  try {
+    It 'a missing value reads as not set' {
+      $s = Get-Gpu4090FastStartup $key
+      $s.Exists | Should Be $false
+      $s.Value | Should Be $null }
+    It 'a written DWORD reads back' {
+      Set-Gpu4090FastStartup @{ Exists = $true; Value = 1 } $key
+      $s = Get-Gpu4090FastStartup $key
+      $s.Exists | Should Be $true
+      $s.Value | Should Be 1 }
+    It 'restoring a not-set state removes the value' {
+      Set-Gpu4090FastStartup @{ Exists = $true; Value = 0 } $key
+      Set-Gpu4090FastStartup ([pscustomobject]@{ Exists = $false; Value = $null }) $key
+      (Get-Gpu4090FastStartup $key).Exists | Should Be $false }
+    It 'restores a state read back from the JSON install record' {
+      $before = ([ordered]@{ Exists = $true; Value = 1 } | ConvertTo-Json | ConvertFrom-Json)
+      Set-Gpu4090FastStartup @{ Exists = $true; Value = 0 } $key
+      Set-Gpu4090FastStartup $before $key
+      (Get-Gpu4090FastStartup $key).Value | Should Be 1 }
+    It 'refuses a value that is not a DWORD' {
+      New-ItemProperty -LiteralPath $key -Name HiberbootEnabled -PropertyType String -Value '1' -Force | Out-Null
+      { Get-Gpu4090FastStartup $key } | Should Throw 'not a DWORD' }
+    It 'describes both states' {
+      Format-Gpu4090FastStartup @{ Exists = $true; Value = 0 } | Should Be 'HiberbootEnabled=0'
+      Format-Gpu4090FastStartup @{ Exists = $false; Value = $null } | Should Be 'HiberbootEnabled not set (Windows default: on)' }
+  } finally { Remove-Item -Path $key -Recurse -Force }
+}

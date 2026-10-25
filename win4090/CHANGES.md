@@ -14,3 +14,17 @@ Retarget to the GeForce RTX 4090 (AD102, 10de:2684) as a board-independent modul
 - New `release.c` (generic display-driver handoff), `boot_io.c` (run-time volume and Windows discovery, log ring,
   3 s countdown, two-entry Esc menu), `app.c` (new flow and failure policy), `build.sh`, `make-package.sh`, `package/`.
 - The VBIOS is never written; see ../README.md.
+
+## Fast Startup and sleep (2026-10-25)
+
+- `Install-Gpu4090Unlock.ps1` turns Windows Fast Startup off (`HiberbootEnabled=0`) after the boot entry is verified.
+  It stores the old value in `install.json` before the change. `-KeepFastStartup` opts out. If a Group Policy forces
+  Fast Startup on, the installer warns and leaves the policy alone.
+- `Uninstall-Gpu4090Unlock.ps1` restores the stored value, unless it was changed after the install. Records from
+  v0.1.0 have no stored value, so nothing is restored for them.
+- `Test-Gpu4090Unlock.ps1` (`Check.cmd`) reports the Fast Startup state. It fails when the installer turned Fast Startup
+  off and something turned it back on, and it explains a stock benchmark result after sleep.
+- Measured on the reference PC: S3 sleep returns the card to stock. Before the sleep, FP16 and BF16 with FP32 accumulate
+  ran at 333 / 332 TF/s against 334 for FP16 accumulate. After a 31 second sleep they ran at 165 / 165 against 333.
+  Resume does not go through the firmware boot path, so the app does not run again.
+- New Pester cases in `tests/windows/Gpu4090Common.Tests.ps1` use a scratch HKCU key.

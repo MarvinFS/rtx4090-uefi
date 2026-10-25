@@ -43,6 +43,17 @@ try {
     }
   }
 
+  # --- Windows Fast Startup (off, unless the install was told to keep it) ------------------------
+  $fs = Get-Gpu4090FastStartup
+  $fsPolicy = Get-Gpu4090FastStartup $Gpu4090FastStartupPolicyKey
+  $fsOn = ($fsPolicy.Exists -and $fsPolicy.Value -ne 0) -or -not ($fs.Exists -and $fs.Value -eq 0)
+  if (-not $fsOn) { Ok 'Windows Fast Startup is off' }
+  elseif ($r.fastStartupKept) { Note "Windows Fast Startup is on, as installed with -KeepFastStartup ($(Format-Gpu4090FastStartup $fs)): after a shut down and start the card may be stock; restart instead" }
+  elseif ($r.fastStartupChanged) {
+    Bad "Windows Fast Startup is on again ($(Format-Gpu4090FastStartup $fs)$(if ($fsPolicy.Exists) { ', Group Policy ' + (Format-Gpu4090FastStartup $fsPolicy) }))"
+    Note 'A Windows update or a policy can turn it back on. Fix: powercfg /h off, or Control Panel, Power Options, Choose what the power buttons do'
+  } else { Note "Windows Fast Startup is on ($(Format-Gpu4090FastStartup $fs)): after a shut down and start the card may be stock; restart instead" }
+
   # --- files on the install partition and the app's boot log -------------------------------------
   $part = Get-Partition | Where-Object { $_.Guid -eq $r.partitionGuid } | Select-Object -First 1
   if (-not $part) { Bad "install partition $($r.partitionGuid) not found" }
@@ -99,7 +110,7 @@ try {
       $ratio = [math]::Min($rate['f16/f32'], $rate['bf16/f32']) / $rate['f16/f16']
       $msg = 'FP32-accumulate rate {0:N0} / {1:N0} TF/s (FP16/BF16) vs FP16-accumulate {2:N0} TF/s, ratio {3:N2}' -f $rate['f16/f32'], $rate['bf16/f32'], $rate['f16/f16'], $ratio
       if ($ratio -ge 0.85) { Ok "UNLOCKED in this session: $msg" }
-      elseif ($ratio -le 0.65) { Bad "STOCK rate in this session: $msg" }
+      elseif ($ratio -le 0.65) { Bad "STOCK rate in this session: $msg"; Note 'If the PC slept since it started, that is expected: sleep returns the card to stock. Restart to unlock again.' }
       else { Bad "inconclusive (another GPU load running?): $msg" }
     }
   }

@@ -21,6 +21,9 @@
 enum {H_CORE,H_BRIDGE,H_GPU,H_NV,H_GFX,H_SPLIT,H_EDID,H_FW,H_CON,H_IGPU,H_IGOP,H_IMG,H_OTHER,H_FIRST_CHILD=16,H_COUNT=40};
 enum {EV_LOG=1,EV_PPH,EV_OPENINFO,EV_OPEN_EXCL,EV_DISCONNECT,EV_CONNECT,EV_CLOSE,EV_SILENCE,EV_UNSILENCE};
 typedef enum {DISC_OK,DISC_ERROR_NOCHANGE,DISC_ERROR_PARTIAL,DISC_SUCCESS_NOOP} FG_DISC;
+/* How an output without a screen shows up: no GOP; no GOP and no device path; a blt-only GOP without a
+   framebuffer; a blt-only GOP with a framebuffer address; a GOP without a mode. */
+enum {DARK_NO_GOP=1,DARK_NO_PATH,DARK_BLT,DARK_BLT_FB,DARK_NO_MODE};
 #define FG_PROTOS 12
 #define FG_OPENS 12
 typedef struct {EFI_HANDLE agent,controller;UINT32 attr,count;} FG_OPEN;
@@ -30,7 +33,8 @@ typedef struct {int live;FG_PROTO protos[FG_PROTOS];int nprotos;} FG_HANDLE;
 static struct {
   FG_HANDLE h[H_COUNT];
   UINT8 path[H_COUNT][96];
-  struct {int root_dev,root_fn,nchild,driver,igpu_gop;} cfg;
+  /* dark: bit k set = child k is an output without a screen of its own, of kind dark_kind (DARK_*) */
+  struct {int root_dev,root_fn,nchild,driver,igpu_gop,dark,dark_kind;} cfg;
   /* behaviour switches */
   FG_DISC disc_mode;EFI_STATUS disc_status,connect_status,enable_status;
   BOOLEAN stop_clears_decode,stop_perturbs_status,stop_replaces_pciio,connect_creates_children,
@@ -130,6 +134,16 @@ static int fg_child(int k,UINT32 adr){
   int i=fg_free_slot();memset(&Fg.h[i],0,sizeof(Fg.h[i]));
   int len=dp_prefix(Fg.path[H_GPU]);memcpy(Fg.path[i],Fg.path[H_GPU],(size_t)len);dp_end(Fg.path[i],dp_adr(Fg.path[i],len,adr));
   fg_gop_data(k,0xf000000000ULL+(UINT64)k*0x1000000ULL,0x870000);
+  int dark=(Fg.cfg.dark>>k)&1?Fg.cfg.dark_kind:0;
+  if(dark==DARK_NO_GOP||dark==DARK_NO_PATH){
+    if(dark==DARK_NO_GOP){fg_add_proto(i,&G_PATH,Fg.path[i]);fg_open(H(i),&G_PATH,H(H_CORE),NULL,EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL,4);}
+    fg_add_proto(i,&G_EDID,&FgDummy[0]);fg_open(H(i),&G_EDID,H(H_NV),NULL,EFI_OPEN_PROTOCOL_GET_PROTOCOL,1);
+    fg_open(H(H_GPU),&G_PATH,H(H_NV),H(i),EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER,1);
+    Fg.child_idx[k]=i;return i;
+  }
+  if(dark==DARK_BLT){FgMode[k].FrameBufferBase=0;FgMode[k].FrameBufferSize=0;FgInfo[k].PixelFormat=PixelBltOnly;}
+  if(dark==DARK_BLT_FB)FgInfo[k].PixelFormat=PixelBltOnly;
+  if(dark==DARK_NO_MODE)FgGop[k].Mode=NULL;
   fg_add_proto(i,&G_PATH,Fg.path[i]);fg_add_proto(i,&G_GOP,&FgGop[k]);
   fg_add_proto(i,&G_TEXTOUT,&FgText[k]);fg_add_proto(i,&G_EDID,&FgDummy[0]);
   fg_open(H(i),&G_PATH,H(H_CORE),NULL,EFI_OPEN_PROTOCOL_BY_HANDLE_PROTOCOL,64);

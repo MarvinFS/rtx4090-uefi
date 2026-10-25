@@ -24,7 +24,7 @@
 typedef struct {EFI_GUID protocol;EFI_OPEN_PROTOCOL_INFORMATION_ENTRY entry;} RECORD;
 typedef struct {
   EFI_HANDLE handle;VOID *gop;UINT64 framebuffer;UINTN framebuffer_size;
-  UINT32 width,height,stride,format;UINT8 path_sha256[32];
+  UINT32 width,height,stride,format;BOOLEAN screen;UINT8 path_sha256[32];
 } CHILD;
 typedef struct {
   EFI_HANDLE agent,image;VOID *base;UINT64 size;UINT32 version;EFI_DRIVER_BINDING_STOP stop;
@@ -70,19 +70,21 @@ static VOID LogRecords(const RECORD *r,UINTN count,EFI_STATUS s) {
       (unsigned long long)(UINTN)r[i].entry.AgentHandle,(unsigned long long)(UINTN)r[i].entry.ControllerHandle);
 }
 static BOOLEAN IsGuid(const EFI_GUID *a,const EFI_GUID *b){return !memcmp(a,b,sizeof(EFI_GUID));}
-/* One physical GOP child of this GPU: sane mode, and its device path descends from the GPU. */
-static EFI_STATUS DescribeGop(EFI_HANDLE handle,CHILD *c) {
-  EFI_GRAPHICS_OUTPUT_PROTOCOL *gop=NULL;EFI_DEVICE_PATH_PROTOCOL *path=NULL;
-  EFI_STATUS s=Gu.bs->HandleProtocol(handle,&GopGuid,(VOID **)&gop);
-  if(EFI_ERROR(s)||!gop||!gop->Mode)return EFI_UNSUPPORTED;
-  EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *m=gop->Mode;
-  if(!m->Info||m->SizeOfInfo<sizeof(*m->Info)||!m->FrameBufferBase||!m->FrameBufferSize||
-     !m->Info->HorizontalResolution||!m->Info->VerticalResolution||
-     m->Info->PixelFormat>PixelBlueGreenRedReserved8BitPerColor||
-     m->Info->PixelsPerScanLine<m->Info->HorizontalResolution||
-     (UINT64)m->Info->PixelsPerScanLine*m->Info->VerticalResolution>m->FrameBufferSize/4)return EFI_UNSUPPORTED;
-  s=Gu.bs->HandleProtocol(handle,&PathGuid,(VOID **)&path);
-  if(EFI_ERROR(s)||!path||!Gu.bs->LocateDevicePath)return EFI_UNSUPPORTED;
+/* A screen: a GOP with a sane linear framebuffer mode. */
+static BOOLEAN Screen(const EFI_GRAPHICS_OUTPUT_PROTOCOL *gop) {
+  const EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *m=gop?gop->Mode:NULL;
+  return m&&m->Info&&m->SizeOfInfo>=sizeof(*m->Info)&&m->FrameBufferBase&&m->FrameBufferSize&&
+    m->Info->HorizontalResolution&&m->Info->VerticalResolution&&
+    m->Info->PixelFormat<=PixelBlueGreenRedReserved8BitPerColor&&
+    m->Info->PixelsPerScanLine>=m->Info->HorizontalResolution&&
+    (UINT64)m->Info->PixelsPerScanLine*m->Info->VerticalResolution<=m->FrameBufferSize/4;
+}
+/* The handle's device path: well formed and descending from this GPU. EFI_NOT_FOUND: no path. */
+static EFI_STATUS GpuPath(EFI_HANDLE handle,EFI_DEVICE_PATH_PROTOCOL **out,UINTN *out_bytes) {
+  EFI_DEVICE_PATH_PROTOCOL *path=NULL;
+  EFI_STATUS s=Gu.bs->HandleProtocol(handle,&PathGuid,(VOID **)&path);
+  if(EFI_ERROR(s)||!path)return EFI_NOT_FOUND;
+  if(!Gu.bs->LocateDevicePath)return EFI_UNSUPPORTED;
   UINTN bytes=0;BOOLEAN end=FALSE;
   for(UINTN i=0;i<128&&bytes<=4092;i++) {
     EFI_DEVICE_PATH_PROTOCOL *node=(VOID *)((UINT8 *)path+bytes);
@@ -95,10 +97,27 @@ static EFI_STATUS DescribeGop(EFI_HANDLE handle,CHILD *c) {
   EFI_DEVICE_PATH_PROTOCOL *remaining=path;EFI_HANDLE parent=NULL;
   s=Gu.bs->LocateDevicePath(&PciGuid,&remaining,&parent);
   if(EFI_ERROR(s)||parent!=Gu.handle)return EFI_ACCESS_DENIED;
-  if(c){
-    c->handle=handle;c->gop=gop;c->framebuffer=m->FrameBufferBase;c->framebuffer_size=m->FrameBufferSize;
-    c->width=m->Info->HorizontalResolution;c->height=m->Info->VerticalResolution;
-    c->stride=m->Info->PixelsPerScanLine;c->format=m->Info->PixelFormat;GuSha256(path,bytes,c->path_sha256);
+  *out=path;*out_bytes=bytes;return EFI_SUCCESS;
+}
+/* One display child of the GPU's driver, recorded whole so the check before the release covers it. The
+   firmware lights one monitor and keeps a child for each further connected output, which may have no GOP,
+   no mode or a blt-only one: such an output is a child without a screen. A child with a GOP must have a
+   device path that descends from this GPU; one without a GOP may have no path at all. */
+static EFI_STATUS DescribeChild(EFI_HANDLE handle,CHILD *c) {
+  EFI_GRAPHICS_OUTPUT_PROTOCOL *gop=NULL;EFI_DEVICE_PATH_PROTOCOL *path=NULL;UINTN bytes=0;
+  if(EFI_ERROR(Gu.bs->HandleProtocol(handle,&GopGuid,(VOID **)&gop)))gop=NULL;
+  EFI_STATUS s=GpuPath(handle,&path,&bytes);
+  if(s==EFI_NOT_FOUND&&!gop)path=NULL;
+  else if(EFI_ERROR(s))return s;
+  c->handle=handle;c->gop=gop;c->screen=Screen(gop);
+  if(path)GuSha256(path,bytes,c->path_sha256);
+  const EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *m=gop?gop->Mode:NULL;
+  if(m){
+    c->framebuffer=m->FrameBufferBase;c->framebuffer_size=m->FrameBufferSize;
+    if(m->Info&&m->SizeOfInfo>=sizeof(*m->Info)){
+      c->width=m->Info->HorizontalResolution;c->height=m->Info->VerticalResolution;
+      c->stride=m->Info->PixelsPerScanLine;c->format=m->Info->PixelFormat;
+    }
   }
   return EFI_SUCCESS;
 }
@@ -108,11 +127,11 @@ static EFI_STATUS DisplayChild(const RECORD *r,OWNER *o) {
      !e->ControllerHandle||e->ControllerHandle==Gu.handle||e->ControllerHandle==Gu.image||
      o->child_count>=MAX_CHILDREN||(!IsGuid(&r->protocol,&PciGuid)&&!IsGuid(&r->protocol,&PathGuid)))return EFI_ACCESS_DENIED;
   for(UINTN i=0;i<o->child_count;i++)if(o->children[i].handle==e->ControllerHandle)return EFI_COMPROMISED_DATA;
-  EFI_STATUS s=DescribeGop(e->ControllerHandle,&o->children[o->child_count]);
+  EFI_STATUS s=DescribeChild(e->ControllerHandle,&o->children[o->child_count]);
   if(!EFI_ERROR(s))o->child_count++;
   return s;
 }
-/* Who holds the GPU. At most one driver, owning the PciIo BY_DRIVER, with GOP children only.
+/* Who holds the GPU. At most one driver, owning the PciIo BY_DRIVER, with display children only.
  * No driver at all is valid, provided nobody else holds anything non-passive. */
 static EFI_STATUS FindOwner(OWNER *o,BOOLEAN log) {
   RECORD records[MAX_RECORDS];UINTN count=0,drivers=0;memset(o,0,sizeof(*o));
@@ -174,32 +193,35 @@ static BOOLEAN SameOwner(const OWNER *a,const OWNER *b) {
   }
   return TRUE;
 }
-/* Physical GOPs whose device path descends from this GPU (children), and all others. */
-static EFI_STATUS GopCount(UINTN *mine,UINTN *others) {
-  EFI_HANDLE *h=NULL;UINTN count=0;*mine=*others=0;
+/* GOPs with a framebuffer whose device path descends from this GPU: screens, and the rest (a mode
+   that is not a screen). GOPs of other devices, and virtual or blt-only ones, are not counted. */
+static EFI_STATUS GopCount(UINTN *screens,UINTN *rest) {
+  EFI_HANDLE *h=NULL;UINTN count=0;*screens=*rest=0;
   EFI_STATUS s=Gu.bs->LocateHandleBuffer(ByProtocol,&GopGuid,NULL,&count,&h);
   if(s==EFI_NOT_FOUND)return EFI_SUCCESS;
   if(s==EFI_SUCCESS&&(!h||!count||count>128))s=EFI_UNSUPPORTED;
   for(UINTN i=0;s==EFI_SUCCESS&&i<count;i++) {
-    EFI_GRAPHICS_OUTPUT_PROTOCOL *g=NULL;EFI_DEVICE_PATH_PROTOCOL *path=NULL;
+    EFI_GRAPHICS_OUTPUT_PROTOCOL *g=NULL;EFI_DEVICE_PATH_PROTOCOL *path=NULL;UINTN bytes=0;
     s=Gu.bs->HandleProtocol(h[i],&GopGuid,(VOID **)&g);
-    if(EFI_ERROR(s)||!g||!g->Mode){s=EFI_COMPROMISED_DATA;break;}
-    if(!g->Mode->FrameBufferBase&&!g->Mode->FrameBufferSize)continue; /* virtual / blt-only */
-    EFI_STATUS d=DescribeGop(h[i],NULL);
-    if(!EFI_ERROR(d)){(*mine)++;continue;}
+    if(EFI_ERROR(s)||!g){s=EFI_COMPROMISED_DATA;break;}
+    if(!g->Mode||(!g->Mode->FrameBufferBase&&!g->Mode->FrameBufferSize))continue; /* virtual / blt-only */
     if(Gu.bs->HandleProtocol(h[i],&PathGuid,(VOID **)&path)!=EFI_SUCCESS||!path){s=EFI_UNSUPPORTED;break;}
-    EFI_HANDLE parent=NULL;EFI_DEVICE_PATH_PROTOCOL *rest=path;
-    if(!EFI_ERROR(Gu.bs->LocateDevicePath(&PciGuid,&rest,&parent))&&parent==Gu.handle){s=d;break;} /* ours but malformed */
-    (*others)++;
+    EFI_HANDLE parent=NULL;EFI_DEVICE_PATH_PROTOCOL *left=path;
+    if(EFI_ERROR(Gu.bs->LocateDevicePath(&PciGuid,&left,&parent))||parent!=Gu.handle)continue; /* another device's */
+    s=GpuPath(h[i],&path,&bytes);if(EFI_ERROR(s))break; /* ours, malformed path */
+    if(Screen(g))(*screens)++;else (*rest)++;
   }
   if(h)Gu.bs->FreePool(h);
   return s;
 }
-/* attached: the GPU's own display children are present; otherwise none may remain. */
+/* attached: the driver's screens are back (at least one if it had any); released: no GOP of this GPU remains. */
 static BOOLEAN Gops(BOOLEAN attached) {
-  UINTN mine,others;EFI_STATUS s=GopCount(&mine,&others);
+  UINTN screens,rest,want=0;EFI_STATUS s=GopCount(&screens,&rest);
   if(EFI_ERROR(s))return FALSE;
-  return attached?(Plan.owner.child_count?(mine>0&&mine<=MAX_CHILDREN):mine==0):mine==0;
+  if(!attached)return !screens&&!rest;
+  for(UINTN i=0;i<Plan.owner.child_count;i++)if(Plan.owner.children[i].screen)want++;
+  if(want)return screens>0&&screens<=MAX_CHILDREN;
+  return Plan.owner.child_count?screens<=MAX_CHILDREN:!screens;
 }
 static EFI_STATUS Alive(VOID) {
   EFI_SYSTEM_TABLE *t=Plan.table;
@@ -272,10 +294,11 @@ EFI_STATUS GuRelPreflight(EFI_SYSTEM_TABLE *t,EFI_HANDLE self,EFI_HANDLE pci) {
   if(s==EFI_SUCCESS&&Alive()!=EFI_SUCCESS)s=EFI_NOT_READY;
   if(s==EFI_SUCCESS)NOTE("release preflight: slot=%zu:%zu:%zu.%zu bar0=%#llx attributes=%#llx driver=%u display_children=%zu bme_entry=%u\n",
     seg,bus,dev,fun,(unsigned long long)Gu.bar_base,(unsigned long long)Plan.attributes,Plan.owner.agent!=NULL,(size_t)Plan.owner.child_count,Plan.bme_entry);
-  for(UINTN i=0;s==EFI_SUCCESS&&i<Plan.owner.child_count;i++)
-    NOTE("display child[%u]: %ux%u stride=%u format=%u fb=%#llx size=%#llx\n",(unsigned)i,Plan.owner.children[i].width,
-      Plan.owner.children[i].height,Plan.owner.children[i].stride,Plan.owner.children[i].format,
-      (unsigned long long)Plan.owner.children[i].framebuffer,(unsigned long long)Plan.owner.children[i].framebuffer_size);
+  for(UINTN i=0;s==EFI_SUCCESS&&i<Plan.owner.child_count;i++){
+    const CHILD *c=&Plan.owner.children[i];
+    NOTE("display child[%u]: %s gop=%u %ux%u stride=%u format=%u fb=%#llx size=%#llx\n",(unsigned)i,c->screen?"screen":"no screen",
+      c->gop!=NULL,c->width,c->height,c->stride,c->format,(unsigned long long)c->framebuffer,(unsigned long long)c->framebuffer_size);
+  }
   NOTE("release preflight: status=%#llx\n",(unsigned long long)s);
   if(s==EFI_SUCCESS)Plan.ready=TRUE;
   return s;

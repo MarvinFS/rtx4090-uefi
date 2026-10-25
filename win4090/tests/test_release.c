@@ -70,7 +70,8 @@ static int gop_under_gpu(void){
   int n=0,len=dp_prefix(Fg.path[H_GPU]);
   for(int i=0;i<H_COUNT;i++){
     FG_PROTO *g=fg_find(H(i),&G_GOP);
-    if(!g||!fg_find(H(i),&G_PATH)||!((EFI_GRAPHICS_OUTPUT_PROTOCOL *)g->iface)->Mode->FrameBufferSize)continue;
+    const EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *m=g?((EFI_GRAPHICS_OUTPUT_PROTOCOL *)g->iface)->Mode:NULL;
+    if(!m||!fg_find(H(i),&G_PATH)||!m->FrameBufferSize)continue;
     if(dp_prefix(Fg.path[i])>len&&!memcmp(Fg.path[i],Fg.path[H_GPU],(size_t)len))n++;
   }
   return n;
@@ -184,6 +185,45 @@ static void s_two_children(void){
   CHECK(Plan.owner.children[0].framebuffer!=Plan.owner.children[1].framebuffer);
   CHECK(GuRelRelease()==EFI_SUCCESS&&gop_under_gpu()==0&&Fg.disconnect_calls==1&&claim_held());
   recover_and_ready(2);
+}
+/* More monitors than the firmware lights: each further output is a child of the driver without a screen. */
+static void s_dark_outputs(void){
+  static const char *names[]={NULL,"two monitors: the second output has no GOP","two monitors: the second output has no GOP and no device path",
+    "two monitors: the second output is blt-only","two monitors: the second output is blt-only with a framebuffer address",
+    "two monitors: the second output's GOP has no mode"};
+  for(int kind=DARK_NO_GOP;kind<=DARK_NO_MODE;kind++){
+    begin(names[kind]);
+    Fg.cfg.nchild=2;Fg.cfg.dark=2;Fg.cfg.dark_kind=kind;rebuild();
+    int fb=kind==DARK_BLT_FB?2:1; /* GOPs under the GPU with a framebuffer */
+    CHECK(pre()==EFI_SUCCESS&&Plan.owner.child_count==2&&gop_under_gpu()==fb);
+    CHECK(Plan.owner.children[0].screen&&!Plan.owner.children[1].screen&&(Plan.owner.children[1].gop!=NULL)==(kind>=DARK_BLT));
+    CHECK(GuRelRelease()==EFI_SUCCESS&&gop_under_gpu()==0&&Fg.disconnect_calls==1&&claim_held()&&GuRelReleased());
+    if(kind!=DARK_BLT_FB){recover_and_ready(fb);continue;}
+    GuStarted();GuQuiesced();Gu.flrs=1;regs_unlocked(); /* and the whole post-transaction path once */
+    BOOLEAN gop=FALSE;
+    CHECK(GuRelFinish(&gop)==EFI_SUCCESS&&gop&&gop_under_gpu()==2&&GuRelReadyForWindows(TRUE)&&no_gpu_writes());
+  }
+  begin("the only output has no screen: accepted, no screen expected back");
+  Fg.cfg.dark=1;Fg.cfg.dark_kind=DARK_NO_GOP;rebuild();
+  CHECK(pre()==EFI_SUCCESS&&Plan.owner.child_count==1&&!Plan.owner.children[0].screen&&GuRelRelease()==EFI_SUCCESS);
+  recover_and_ready(0);
+  begin("a GOP child whose mode is not sane is an output without a screen");
+  Fg.cfg.nchild=2;rebuild();FgInfo[1].PixelsPerScanLine=100; /* narrower than the width */
+  CHECK(pre()==EFI_SUCCESS&&Plan.owner.children[0].screen&&!Plan.owner.children[1].screen);
+  CHECK(GuRelRelease()==EFI_SUCCESS&&gop_under_gpu()==0);
+  recover_and_ready(2); /* the fake driver brings both back with sane modes */
+  begin("abort: an output without a screen gains one after preflight");
+  Fg.cfg.nchild=2;Fg.cfg.dark=2;Fg.cfg.dark_kind=DARK_BLT_FB;rebuild();
+  CHECK(pre()==EFI_SUCCESS);FgInfo[1].PixelFormat=PixelBlueGreenRedReserved8BitPerColor;
+  CHECK(GuRelRelease()==EFI_ABORTED&&Fg.disconnect_calls==0&&!GuRelMutated()&&!silenced);
+  begin("abort: an output without a screen disappears after preflight");
+  Fg.cfg.nchild=2;Fg.cfg.dark=2;Fg.cfg.dark_kind=DARK_NO_GOP;rebuild();
+  CHECK(pre()==EFI_SUCCESS);fg_remove_opens(fg_find(H(H_GPU),&G_PATH),H(H_NV),EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER);
+  fg_open(H(H_GPU),&G_PATH,H(H_NV),H(Fg.child_idx[0]),EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER,1);
+  CHECK(GuRelRelease()==EFI_ABORTED&&Fg.disconnect_calls==0&&!GuRelMutated());
+  begin("GuRelReleased: a GOP of ours without a screen came back while claimed");
+  CHECK(pre()==EFI_SUCCESS&&GuRelRelease()==EFI_SUCCESS&&GuRelReleased());
+  Fg.cfg.dark=2;Fg.cfg.dark_kind=DARK_BLT_FB;fg_child(1,ChildAdr[1]);CHECK(!GuRelReleased());
 }
 static void s_any_slot(void){
   begin("any slot, any BAR0 address, any subsystem");
@@ -354,19 +394,21 @@ static void s_refuse_preflight(void){
     fg_open(H(H_GPU),&G_PCI,H(H_CON),H(H_GPU),EFI_OPEN_PROTOCOL_BY_DRIVER,1);
   }
   refused_clean(pre(),EFI_ACCESS_DENIED);
-  begin("refuse: BY_CHILD child that is not a GOP");
+  begin("refuse: BY_CHILD GOP child without a device path");
+  Fg.cfg.nchild=0;rebuild();
+  { int i=fg_free_slot();memset(&Fg.h[i],0,sizeof(Fg.h[i]));fg_gop_data(0,0xf000000000ULL,0x870000);
+    fg_add_proto(i,&G_GOP,&FgGop[0]);fg_open(H(H_GPU),&G_PATH,H(H_NV),H(i),EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER,1); }
+  refused_clean(pre(),EFI_NOT_FOUND);
+  begin("refuse: BY_CHILD child without a GOP whose path does not descend from the GPU");
   Fg.cfg.nchild=0;rebuild();
   { int i=fg_free_slot();memset(&Fg.h[i],0,sizeof(Fg.h[i]));
-    int len=dp_prefix(Fg.path[H_GPU]);memcpy(Fg.path[i],Fg.path[H_GPU],(size_t)len);dp_end(Fg.path[i],dp_adr(Fg.path[i],len,0x80010320U));
+    int len=dp_prefix(Fg.path[H_IGPU]);memcpy(Fg.path[i],Fg.path[H_IGPU],(size_t)len);dp_end(Fg.path[i],dp_adr(Fg.path[i],len,0x80010320U));
     fg_add_proto(i,&G_PATH,Fg.path[i]);fg_open(H(H_GPU),&G_PATH,H(H_NV),H(i),EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER,1); }
-  refused_clean(pre(),EFI_UNSUPPORTED);
+  refused_clean(pre(),EFI_ACCESS_DENIED);
   begin("refuse: BY_CHILD GOP whose path does not descend from the GPU");
   Fg.cfg.nchild=0;Fg.cfg.igpu_gop=1;rebuild();
   fg_open(H(H_GPU),&G_PATH,H(H_NV),H(H_IGOP),EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER,1);
   refused_clean(pre(),EFI_ACCESS_DENIED);
-  begin("refuse: BY_CHILD GOP with an insane mode");
-  Fg.cfg.nchild=1;rebuild();FgInfo[0].PixelsPerScanLine=100; /* narrower than the width */
-  refused_clean(pre(),EFI_UNSUPPORTED);
   begin("refuse: BY_CHILD record names the GPU itself");
   Fg.cfg.nchild=0;rebuild();fg_open(H(H_GPU),&G_PATH,H(H_NV),H(H_GPU),EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER,1);
   refused_clean(pre(),EFI_ACCESS_DENIED);
@@ -611,7 +653,7 @@ int main(int argc,char **argv){
   s_post_transaction(0,0);s_post_transaction(1,1);
   s_bme_entry(0,0,0);s_bme_entry(1,0,0);s_bme_entry(0,1,0);s_bme_entry(1,1,0);s_bme_entry(0,0,1);s_bme_entry(1,1,1);
   s_bme_no_driver();s_bme_cached_only();s_bme_failures();s_bme_driver_reconnect();
-  s_no_driver();s_two_children();s_any_slot();s_other_gop(1);s_other_gop(2);s_volatile_status();s_released_check();
+  s_no_driver();s_two_children();s_dark_outputs();s_any_slot();s_other_gop(1);s_other_gop(2);s_volatile_status();s_released_check();
   s_refuse_preflight();s_release_preconditions();s_changed_before_release();
   s_disconnect_failures();s_drift_and_decode();s_reconnect_no_gop();s_recover_refused();s_finish_preconditions();s_ready_preconditions();
   printf("release host tests: %u scenarios, %u checks PASS (fake UEFI core on the surveyed topology; no GPU write counted)\n",Scenarios,Checks);
